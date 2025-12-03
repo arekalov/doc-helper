@@ -1,6 +1,6 @@
 package com.arekalov.dochelper.services
 
-import com.arekalov.dochelper.domain.Document
+import com.arekalov.dochelper.domain.*
 import com.arekalov.dochelper.services.mcp.McpClient
 import kotlinx.serialization.json.*
 import mu.KotlinLogging
@@ -208,5 +208,194 @@ class GitHubMcpService(private val githubToken: String) {
     fun close() {
         mcpClient?.stop()
         logger.info { "GitHubMcpService закрыт" }
+    }
+    
+    // ═══════════════════════════════════════════════════════════════
+    // PR Review Methods
+    // ═══════════════════════════════════════════════════════════════
+    
+    /**
+     * Парсинг URL Pull Request
+     * Поддерживает форматы:
+     * - https://github.com/owner/repo/pull/123
+     * - github.com/owner/repo/pull/123
+     */
+    fun parsePrUrl(prUrl: String): Triple<String, String, Int>? {
+        return try {
+            val pattern = Regex("github\\.com/([^/]+)/([^/]+)/pull/(\\d+)")
+            val match = pattern.find(prUrl)
+            if (match != null) {
+                val owner = match.groupValues[1]
+                val repo = match.groupValues[2]
+                val prNumber = match.groupValues[3].toInt()
+                Triple(owner, repo, prNumber)
+            } else {
+                null
+            }
+        } catch (e: Exception) {
+            logger.error(e) { "Ошибка при парсинге PR URL: $prUrl" }
+            null
+        }
+    }
+    
+    /**
+     * Получение информации о Pull Request
+     */
+    suspend fun getPullRequest(owner: String, repo: String, prNumber: Int): PullRequest? {
+        return try {
+            logger.info { "Получаем информацию о PR #$prNumber в $owner/$repo" }
+            
+            val url = "https://api.github.com/repos/$owner/$repo/pulls/$prNumber"
+            val jsonContent = executeGitHubApiRequest(url)
+            
+            if (jsonContent != null) {
+                logger.debug { "Парсим JSON ответ PR..." }
+                val jsonElement = json.parseToJsonElement(jsonContent).jsonObject
+                
+                val pr = PullRequest(
+                    number = prNumber,
+                    title = jsonElement["title"]?.jsonPrimitive?.content ?: "Без названия",
+                    description = jsonElement["body"]?.jsonPrimitive?.contentOrNull,
+                    owner = owner,
+                    repo = repo,
+                    headBranch = jsonElement["head"]?.jsonObject?.get("ref")?.jsonPrimitive?.content ?: "unknown",
+                    baseBranch = jsonElement["base"]?.jsonObject?.get("ref")?.jsonPrimitive?.content ?: "main",
+                    author = jsonElement["user"]?.jsonObject?.get("login")?.jsonPrimitive?.content ?: "unknown",
+                    state = jsonElement["state"]?.jsonPrimitive?.content ?: "unknown",
+                    url = "https://github.com/$owner/$repo/pull/$prNumber"
+                )
+                logger.info { "✅ PR получен: #${pr.number} - ${pr.title}" }
+                pr
+            } else {
+                logger.error { "Не удалось получить информацию о PR" }
+                null
+            }
+        } catch (e: Exception) {
+            logger.error(e) { "Ошибка при получении PR #$prNumber: ${e.message}" }
+            null
+        }
+    }
+    
+    /**
+     * Получение списка изменённых файлов в PR
+     */
+    suspend fun getPrFiles(owner: String, repo: String, prNumber: Int): List<PrFile> {
+        return try {
+            logger.info { "Получаем файлы PR #$prNumber в $owner/$repo" }
+            
+            val url = "https://api.github.com/repos/$owner/$repo/pulls/$prNumber/files"
+            val jsonContent = executeGitHubApiRequest(url)
+            
+            if (jsonContent != null) {
+                val files = json.parseToJsonElement(jsonContent).jsonArray
+                
+                files.mapNotNull { fileElement ->
+                    try {
+                        val file = fileElement.jsonObject
+                        PrFile(
+                            filename = file["filename"]?.jsonPrimitive?.content ?: return@mapNotNull null,
+                            status = file["status"]?.jsonPrimitive?.content ?: "modified",
+                            additions = file["additions"]?.jsonPrimitive?.int ?: 0,
+                            deletions = file["deletions"]?.jsonPrimitive?.int ?: 0,
+                            patch = file["patch"]?.jsonPrimitive?.contentOrNull
+                        )
+                    } catch (e: Exception) {
+                        logger.warn(e) { "Ошибка парсинга файла" }
+                        null
+                    }
+                }
+            } else {
+                emptyList()
+            }
+        } catch (e: Exception) {
+            logger.error(e) { "Ошибка при получении файлов PR #$prNumber" }
+            emptyList()
+        }
+    }
+    
+    /**
+     * Получение полного diff PR
+     */
+    suspend fun getPrDiff(prUrl: String): PrDiff? {
+        val parsed = parsePrUrl(prUrl)
+        if (parsed == null) {
+            logger.error { "Неверный формат URL PR: $prUrl" }
+            return null
+        }
+        
+        val (owner, repo, prNumber) = parsed
+        
+        val pullRequest = getPullRequest(owner, repo, prNumber)
+        if (pullRequest == null) {
+            logger.error { "Не удалось получить информацию о PR" }
+            return null
+        }
+        
+        val files = getPrFiles(owner, repo, prNumber)
+        
+        return PrDiff(
+            pullRequest = pullRequest,
+            files = files,
+            totalAdditions = files.sumOf { it.additions },
+            totalDeletions = files.sumOf { it.deletions },
+            totalChangedFiles = files.size
+        )
+    }
+    
+    /**
+     * Получение содержимого файла из PR (текущая версия после изменений)
+     */
+    suspend fun getFileFromPr(owner: String, repo: String, branch: String, path: String): String? {
+        return getFileContentViaApi(owner, repo, path, branch)
+    }
+    
+    /**
+     * Выполнение запроса к GitHub API
+     */
+    private fun executeGitHubApiRequest(url: String): String? {
+        return try {
+            logger.info { "GitHub API запрос: $url" }
+            
+            val process = ProcessBuilder(
+                "curl", "-s", "-L",
+                "-H", "Authorization: token $githubToken",
+                "-H", "Accept: application/vnd.github.v3+json",
+                url
+            )
+                .redirectErrorStream(true)
+                .start()
+            
+            val content = process.inputStream.bufferedReader().readText()
+            val exitCode = process.waitFor()
+            
+            logger.debug { "API ответ (exit=$exitCode): ${content.take(200)}..." }
+            
+            // Проверяем на ошибки API
+            if (content.contains("\"message\"")) {
+                // Возможно это ошибка от GitHub API
+                if (content.contains("Bad credentials") || content.contains("401")) {
+                    logger.error { "❌ Ошибка авторизации GitHub. Проверьте токен!" }
+                    return null
+                }
+                if (content.contains("Not Found") || content.contains("404")) {
+                    logger.error { "❌ PR не найден: $url" }
+                    return null
+                }
+                if (content.contains("rate limit")) {
+                    logger.error { "❌ Превышен лимит запросов GitHub API" }
+                    return null
+                }
+            }
+            
+            if (exitCode == 0 && content.isNotBlank()) {
+                content
+            } else {
+                logger.error { "API запрос неуспешен: exit=$exitCode, content=${content.take(500)}" }
+                null
+            }
+        } catch (e: Exception) {
+            logger.error(e) { "Ошибка API запроса: $url" }
+            null
+        }
     }
 }

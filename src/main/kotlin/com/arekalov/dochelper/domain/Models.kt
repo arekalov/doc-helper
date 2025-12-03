@@ -61,3 +61,73 @@ data class Session(
     var isIndexed: Boolean = false
 )
 
+// ═══════════════════════════════════════════════════════════════
+// PR Review Models
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Информация о Pull Request
+ */
+data class PullRequest(
+    val number: Int,
+    val title: String,
+    val description: String?,
+    val owner: String,
+    val repo: String,
+    val headBranch: String,
+    val baseBranch: String,
+    val author: String,
+    val state: String,
+    val url: String
+)
+
+/**
+ * Изменённый файл в PR
+ */
+data class PrFile(
+    val filename: String,
+    val status: String,        // added, removed, modified, renamed
+    val additions: Int,
+    val deletions: Int,
+    val patch: String?         // diff для файла
+)
+
+/**
+ * Полный diff PR
+ */
+data class PrDiff(
+    val pullRequest: PullRequest,
+    val files: List<PrFile>,
+    val totalAdditions: Int,
+    val totalDeletions: Int,
+    val totalChangedFiles: Int
+)
+
+/**
+ * Проблема найденная при ревью
+ */
+data class ReviewIssue(
+    val severity: IssueSeverity,
+    val file: String,
+    val description: String,
+    val suggestion: String? = null,
+    val lineContext: String? = null
+)
+
+enum class IssueSeverity {
+    ERROR,      // 🔴 Критическая проблема
+    WARNING,    // 🟡 Потенциальная проблема
+    INFO        // 🔵 Совет по улучшению
+}
+
+/**
+ * Результат ревью PR
+ */
+data class ReviewResult(
+    val pullRequest: PullRequest,
+    val issues: List<ReviewIssue>,
+    val summary: String,
+    val ragContext: List<SearchResult>,
+    val durationMs: Long
+)
+

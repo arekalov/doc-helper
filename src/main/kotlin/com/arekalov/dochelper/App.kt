@@ -26,12 +26,17 @@ fun main(args: Array<String>) = runBlocking {
         val githubService = GitHubMcpService(config.githubToken)
         githubService.initialize()
         
+        // Сервис ревью PR
+        val prReviewService = PrReviewService(
+            githubService, vectorStore, embeddingService, yandexGptService
+        )
+        
         // Состояние сессии
         val session = Session()
         
         try {
             // Главный цикл приложения
-            mainLoop(session, ragAgent, githubService)
+            mainLoop(session, ragAgent, githubService, prReviewService)
         } finally {
             // Закрытие ресурсов
             githubService.close()
@@ -52,7 +57,8 @@ fun main(args: Array<String>) = runBlocking {
 suspend fun mainLoop(
     session: Session,
     ragAgent: RagAgent,
-    githubService: GitHubMcpService
+    githubService: GitHubMcpService,
+    prReviewService: PrReviewService
 ) {
     var isRunning = true
     
@@ -84,6 +90,10 @@ suspend fun mainLoop(
             }
             input == "/branch" -> {
                 handleBranch(session, githubService)
+            }
+            input.startsWith("/review ") -> {
+                val prUrl = input.substring(8).trim()
+                handleReview(prUrl, prReviewService, session)
             }
             input == "/clear" -> {
                 session.conversationHistory.clear()
@@ -119,7 +129,7 @@ fun printBanner() {
     println()
     println("╔═══════════════════════════════════════════════════════════════╗")
     println("║             Doc Helper - Помощник по документации            ║")
-    println("║                   AI Advent 2024: Day 17-18                  ║")
+    println("║          AI Advent 2024: Day 17-18 + Day 21 (Review)         ║")
     println("╚═══════════════════════════════════════════════════════════════╝")
     println()
 }
@@ -132,6 +142,7 @@ fun printMenu(session: Session) {
     println("📋 Доступные команды:")
     println("  /repo <url>     - Установить URL репозитория")
     println("  /index          - Проиндексировать документацию")
+    println("  /review <pr>    - 🔍 Ревью Pull Request (Day 21)")
     println("  /help [вопрос]  - Помощь по проекту")
     println("  /branch         - Показать текущую ветку (git branch)")
     println("  /stats          - Статистика индекса")
@@ -315,6 +326,107 @@ fun handleStats(ragAgent: RagAgent) {
             0
         }
         println("  • Среднее чанков на документ: $avgChunksPerDoc")
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Day 21: PR Review
+// ═══════════════════════════════════════════════════════════════
+
+/**
+ * Обработка команды /review <pr_url>
+ */
+suspend fun handleReview(prUrl: String, prReviewService: PrReviewService, session: Session) {
+    if (prUrl.isBlank()) {
+        println("❌ Укажите URL Pull Request")
+        println("   Пример: /review https://github.com/owner/repo/pull/123")
+        return
+    }
+    
+    // Проверяем формат URL
+    if (!prUrl.contains("github.com") || !prUrl.contains("/pull/")) {
+        println("❌ Неверный формат URL")
+        println("   Ожидается: https://github.com/owner/repo/pull/123")
+        return
+    }
+    
+    println()
+    println("╔═══════════════════════════════════════════════════════════════╗")
+    println("║                    🔍 PR Code Review                         ║")
+    println("╚═══════════════════════════════════════════════════════════════╝")
+    println()
+    println("📥 Получаем информацию о PR...")
+    
+    try {
+        val result = prReviewService.reviewPr(prUrl)
+        
+        if (result == null) {
+            println("❌ Не удалось получить PR. Проверьте:")
+            println("   • Корректность URL")
+            println("   • Права доступа к репозиторию")
+            println("   • Наличие GitHub токена")
+            return
+        }
+        
+        // Выводим информацию о PR
+        println()
+        println("═══════════════════════════════════════════════════════════════")
+        println("📋 PR #${result.pullRequest.number}: ${result.pullRequest.title}")
+        println("═══════════════════════════════════════════════════════════════")
+        println("👤 Автор: ${result.pullRequest.author}")
+        println("🌿 ${result.pullRequest.headBranch} → ${result.pullRequest.baseBranch}")
+        println()
+        
+        // Выводим резюме ревью
+        println("─────────────────────────────────────────────────────────────────")
+        println("📝 РЕВЬЮ:")
+        println("─────────────────────────────────────────────────────────────────")
+        println()
+        println(result.summary)
+        println()
+        
+        // Статистика по найденным проблемам
+        if (result.issues.isNotEmpty()) {
+            println("─────────────────────────────────────────────────────────────────")
+            println("📊 СТАТИСТИКА ПРОБЛЕМ:")
+            println("─────────────────────────────────────────────────────────────────")
+            
+            val errors = result.issues.count { it.severity == com.arekalov.dochelper.domain.IssueSeverity.ERROR }
+            val warnings = result.issues.count { it.severity == com.arekalov.dochelper.domain.IssueSeverity.WARNING }
+            val infos = result.issues.count { it.severity == com.arekalov.dochelper.domain.IssueSeverity.INFO }
+            
+            if (errors > 0) println("  🔴 Критических: $errors")
+            if (warnings > 0) println("  🟡 Предупреждений: $warnings")
+            if (infos > 0) println("  🔵 Советов: $infos")
+            println()
+        }
+        
+        // Использованный контекст из RAG
+        if (result.ragContext.isNotEmpty()) {
+            println("─────────────────────────────────────────────────────────────────")
+            println("📚 ИСПОЛЬЗОВАННЫЙ КОНТЕКСТ (RAG):")
+            println("─────────────────────────────────────────────────────────────────")
+            result.ragContext.forEachIndexed { index, searchResult ->
+                val fileName = searchResult.chunk.metadata["fileName"] ?: searchResult.chunk.documentPath
+                val similarity = String.format("%.1f", searchResult.similarity * 100)
+                println("  ${index + 1}. $fileName (релевантность: $similarity%)")
+            }
+            println()
+        } else if (session.isIndexed) {
+            println("ℹ️  Контекст из документации не использовался (нет релевантных совпадений)")
+            println()
+        } else {
+            println("💡 Совет: Проиндексируйте репозиторий (/repo + /index) для использования контекста")
+            println()
+        }
+        
+        println("═══════════════════════════════════════════════════════════════")
+        println("⏱️  Время ревью: ${result.durationMs / 1000.0} сек")
+        println("═══════════════════════════════════════════════════════════════")
+        
+    } catch (e: Exception) {
+        logger.error(e) { "Ошибка при ревью PR" }
+        println("❌ Ошибка: ${e.message}")
     }
 }
 
